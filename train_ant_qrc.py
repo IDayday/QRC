@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from multiworld.envs.mujoco import register_custom_envs as register_mujoco_envs
 
-from HER_adaptive_backup import HERReplayBuffer, PathBuilder, GOAL_TYPE_FUTURE, GOAL_TYPE_ROLLOUT
+from HER_adaptive_backup import HERReplayBuffer, PathBuilder, GOAL_TYPE_FUTURE, GOAL_TYPE_ROLLOUT, GOAL_TYPE_REPLAY
 from QRC import QRCAgent
 
 
@@ -29,14 +29,19 @@ CSV_FIELDS = [
     "row_type", "wall_time", "elapsed_min", "env_step", "update", "episode", "episode_step",
     "exp_name", "env_name", "seed", "replay_size", "steps_per_second",
     "eval_train_success", "eval_train_distance", "eval_test_success", "eval_test_distance",
-    "train_episode_distance", "train_future_goal_ratio",
-    "critic_loss", "actor_loss", "actor_z_action_mean",
-    "z_td_loss", "z_direct_loss", "z_direct_pred", "z_direct_target", "z_mean", "z_min", "z_max",
+    "train_episode_distance", "train_orig_goal_ratio", "train_future_goal_ratio", "train_replay_goal_ratio", "train_actor_goal_ratio",
+    "critic_loss", "actor_loss", "actor_loss_step", "actor_loss_ema",
+    "actor_z_action_mean", "actor_z_action_mean_step", "actor_z_action_mean_ema", "actor_update_flag", "actor_update_count", "actor_batch_fraction",
+    "z_td_loss", "z_td_target_mean", "z_td_pred_mean", "z_td_hit_rate", "z_direct_loss", "z_direct_pred", "z_direct_target", "z_direct_gap", "z_mean", "z_min", "z_max",
+    "z_replay_goal_mean", "z_replay_goal_td_target", "z_actor_goal_mean",
     "d_mean", "d_saturation_rate",
-    "qrc_closure_loss", "qrc_closure_uplift", "qrc_best_z_cert", "qrc_best_d_cert",
+    "qrc_td_closure_override_rate", "qrc_td_direct_next_z_mean", "qrc_td_closure_next_z_mean",
+    "qrc_td_closure_gap_mean", "qrc_td_best_z_raw", "qrc_td_best_z_lcb",
+    "qrc_closure_loss", "qrc_closure_uplift", "qrc_best_z_cert", "qrc_best_z_lcb", "qrc_best_z_raw", "qrc_best_z_raw_at_lcb", "qrc_best_d_cert",
     "qrc_witness_hit_rate", "qrc_candidate_m", "qrc_nondegenerate_rate", "qrc_random_vs_projected_ratio",
-    "qrc_closure_accept_rate", "qrc_closure_gap", "qrc_raw_planner_failure_rate",
-    "qrc_projected_distance", "qrc_triangle_violation_rate", "qrc_closure_target_outlier_rate",
+    "qrc_closure_accept_rate", "qrc_raw_accept_rate", "qrc_closure_gap", "qrc_closure_gap_lcb", "qrc_closure_gap_raw",
+    "qrc_pred_z_mean", "qrc_cert_suppression", "qrc_cert_mu_sm", "qrc_cert_mu_mg", "qrc_cert_sig_sm", "qrc_cert_sig_mg",
+    "qrc_raw_planner_failure_rate", "qrc_projected_distance", "qrc_triangle_violation_rate", "qrc_closure_target_outlier_rate",
     "evidence_direct_edge_count", "evidence_stitch_coverage_rate", "evidence_join_dist", "evidence_join_conf",
     "evidence_h1", "evidence_h2", "evidence_target_z", "stitch_loss",
     "proposal_loss", "calib_beta", "calib_beta_new",
@@ -90,6 +95,18 @@ def infer_dims(env) -> Tuple[int, int, int]:
     return state_dim, goal_dim, action_dim
 
 
+def seed_env(env, seed: int):
+    """兼容旧 gym / multiworld 的环境播种。"""
+    try:
+        env.seed(int(seed))
+    except Exception:
+        pass
+    try:
+        env.action_space.seed(int(seed))
+    except Exception:
+        pass
+
+
 def goal_from_state_np(state_np: np.ndarray, goal_dim: int) -> np.ndarray:
     if state_np.shape[-1] == goal_dim:
         return state_np
@@ -103,13 +120,16 @@ def sample_control_batch(
     replay_buffer: HERReplayBuffer,
     batch_size: int,
     p_orig: float,
+    p_future: float,
+    p_replay_goal: float,
     h_relab: int,
     goal_dim: int,
     device: torch.device,
 ):
-    """采样 QRC control batch：原始目标 + same-episode future goals。
+    """采样 QRC control batch。
 
-    这里不预存 reward；QRC 的 TD-Z 只需要 success(next_state, goal) 在线判定。
+    目标混合：original goal + same-episode future goal + replay/random achieved goal。
+    replay/random goal 只用于 TD-Z 约束 critic，不用于 direct evidence，也默认不用于 actor 更新。
     """
     ep_slots, step_indices = replay_buffer._sample_episode_time_indices(batch_size)
     lengths = replay_buffer._episode_lengths[ep_slots].astype(np.int64)
@@ -130,8 +150,18 @@ def sample_control_batch(
     if goals_np.shape[-1] != goal_dim:
         goals_np = goal_from_state_np(goals_np, goal_dim)
 
-    use_orig = replay_buffer._rng.random(batch_size) < float(p_orig)
-    use_future = ~use_orig
+    # 中文注释：用显式三路 goal mix，而不是只有 orig/future。
+    # replay/random goal 为 critic 提供更多低可达性 TD 约束，抑制 direct evidence 带来的过乐观。
+    probs = np.asarray([float(p_orig), float(p_future), float(p_replay_goal)], dtype=np.float64)
+    if probs.sum() <= 0:
+        probs = np.asarray([0.25, 0.50, 0.25], dtype=np.float64)
+    probs = np.maximum(probs, 0.0)
+    probs = probs / probs.sum()
+    u = replay_buffer._rng.random(batch_size)
+    use_orig = u < probs[0]
+    use_future = (u >= probs[0]) & (u < probs[0] + probs[1])
+    use_replay = ~(use_orig | use_future)
+
     goal_source_type = np.full(batch_size, GOAL_TYPE_ROLLOUT, dtype=np.int64)
     goal_source_episode_slot = np.full(batch_size, -1, dtype=np.int64)
     goal_source_index = np.full(batch_size, -1, dtype=np.int64)
@@ -141,10 +171,8 @@ def sample_control_batch(
         # future_step=start+h-1，允许 h=1，即下一状态 achieved goal。
         max_future = np.minimum(lengths[idx] - 1, step_indices[idx] + int(h_relab) - 1)
         max_future = np.maximum(max_future, step_indices[idx])
-        future_steps = np.array([
-            replay_buffer._rng.integers(int(s), int(e) + 1)
-            for s, e in zip(step_indices[idx], max_future)
-        ], dtype=np.int64)
+        span = np.maximum(max_future - step_indices[idx] + 1, 1).astype(np.int64)
+        future_steps = step_indices[idx] + np.floor(replay_buffer._rng.random(idx.shape[0]) * span).astype(np.int64)
         if ag_key in replay_buffer._next_obs:
             future_goals = replay_buffer._next_obs[ag_key][ep_slots[idx], future_steps]
         else:
@@ -156,6 +184,20 @@ def sample_control_batch(
         goal_source_episode_slot[idx] = ep_slots[idx]
         goal_source_index[idx] = future_steps
 
+    if np.any(use_replay):
+        idx = np.where(use_replay)[0]
+        replay_ep, replay_step = replay_buffer._sample_episode_time_indices(idx.shape[0])
+        if ag_key in replay_buffer._next_obs:
+            replay_goals = replay_buffer._next_obs[ag_key][replay_ep, replay_step]
+        else:
+            replay_goals = goal_from_state_np(replay_buffer._next_obs[obs_key][replay_ep, replay_step], goal_dim)
+        if replay_goals.shape[-1] != goal_dim:
+            replay_goals = goal_from_state_np(replay_goals, goal_dim)
+        goals_np[idx] = replay_goals
+        goal_source_type[idx] = GOAL_TYPE_REPLAY
+        goal_source_episode_slot[idx] = replay_ep
+        goal_source_index[idx] = replay_step
+
     states = torch.as_tensor(states_np, dtype=torch.float32, device=device)
     actions = torch.as_tensor(actions_np, dtype=torch.float32, device=device)
     next_states = torch.as_tensor(next_states_np, dtype=torch.float32, device=device)
@@ -166,7 +208,10 @@ def sample_control_batch(
         "goal_source_type": goal_source_type.reshape(-1).astype(np.int64),
         "goal_source_episode_slot": goal_source_episode_slot.reshape(-1).astype(np.int64),
         "goal_source_index": goal_source_index.reshape(-1).astype(np.int64),
+        "orig_goal_ratio": float(np.mean(use_orig.astype(np.float32))),
         "future_goal_ratio": float(np.mean(use_future.astype(np.float32))),
+        "replay_goal_ratio": float(np.mean(use_replay.astype(np.float32))),
+        "actor_goal_ratio": float(np.mean((~use_replay).astype(np.float32))),
     }
     return states, actions, next_states, goals, batch_info
 
@@ -185,8 +230,8 @@ def eval_policy(policy: QRCAgent, env, n_eval: int, max_episode_length: int, dis
             next_obs, _, _, status = env.step(action)
             state = next_obs["observation"]
             dist = _as_float_dist(status)
-            done = dist < distance_threshold or t >= max_episode_length
             t += 1
+            done = dist < distance_threshold or t >= max_episode_length
             if done:
                 distances.append(float(dist))
                 successes.append(float(dist < distance_threshold))
@@ -229,7 +274,7 @@ def make_parser():
     p.add_argument("--exp_name", default="qrc")
     p.add_argument("--log_root", default="results_qrc")
     p.add_argument("--save_freq", default=50000, type=int)
-    p.add_argument("--csv_train_log_freq", default=100, type=int)
+    p.add_argument("--csv_train_log_freq", default=101, type=int, help="默认用 101 避免与 policy_delay=2 发生日志采样别名；代码也记录 last/EMA actor 指标")
 
     # QRC core hyperparameters
     p.add_argument("--gamma", default=0.98, type=float, help="reachability Z=gamma^d 的折扣，Ant 推荐 0.98")
@@ -244,14 +289,22 @@ def make_parser():
     p.add_argument("--policy_delay", default=2, type=int)
     p.add_argument("--actor_agg", default="mean", choices=["mean", "min"])
     p.add_argument("--action_l2", default=1e-4, type=float)
+    p.add_argument("--deterministic_actor_update", dest="deterministic_actor_update", action="store_true",
+                   help="actor 更新使用 tanh(mean)；更贴近 QRC 文档中的 μ_phi")
+    p.add_argument("--no-deterministic_actor_update", dest="deterministic_actor_update", action="store_false")
+    p.set_defaults(deterministic_actor_update=True)
+    p.add_argument("--exploration_noise", default=0.10, type=float, help="环境交互时加到 mean action 上的 Gaussian 噪声；eval 不使用")
+    p.add_argument("--torch_num_threads", default=1, type=int, help="限制每个实验进程 CPU 线程，便于多卡并行")
 
     # Evidence / closure weights
-    p.add_argument("--p_orig", default=0.25, type=float, help="control batch 中原始目标比例；其余为 future goal")
+    p.add_argument("--p_orig", default=0.25, type=float, help="control batch 中原始目标比例")
+    p.add_argument("--p_future", default=0.50, type=float, help="control batch 中 same-episode future goal 比例；actor 可使用")
+    p.add_argument("--p_replay_goal", default=0.25, type=float, help="control batch 中 replay/random achieved goal 比例；只约束 critic TD，默认不更新 actor")
     p.add_argument("--h_relab", default=32, type=int, help="future-pair evidence window")
     p.add_argument("--lambda_dir", default=1.0, type=float, help="direct same-trajectory evidence loss 权重")
     p.add_argument("--lambda_clo", default=0.05, type=float, help="closure one-sided distillation loss 权重")
     p.add_argument("--lambda_stitch", default=0.0, type=float, help="stitched evidence loss 权重；默认关闭")
-    p.add_argument("--lambda_proposal", default=0.05, type=float, help="proposal 监督损失权重；只影响 candidate proposal")
+    p.add_argument("--lambda_proposal", default=0.0, type=float, help="proposal 监督损失权重；direct/random 阶段必须为 0，projected/mixed 阶段可设 0.05")
     p.add_argument("--direct_batch_size", default=256, type=int)
     p.add_argument("--closure_batch_size", default=128, type=int)
     p.add_argument("--stitch_batch_size", default=128, type=int)
@@ -260,7 +313,14 @@ def make_parser():
     p.add_argument("--projection_pool_size", default=64, type=int)
     p.add_argument("--closure_start_updates", default=5000, type=int)
     p.add_argument("--closure_margin_z", default=0.0, type=float)
+    p.add_argument("--closure_loss_target", default="lcb", choices=["lcb", "raw"],
+                   help="one-sided closure 的 target：lcb 为主方法，raw 仅用于诊断 LCB 是否过保守")
+    p.add_argument("--td_closure_mode", default="none", choices=["none", "recursive_raw", "recursive_lcb"],
+                   help="不安全 recursive TD closure 对照；主方法必须保持 none")
+    p.add_argument("--td_closure_start_updates", default=0, type=int,
+                   help="recursive TD closure 对照从第几个 update 开始")
     p.add_argument("--beta_init", default=2.0, type=float)
+    p.add_argument("--beta_mode", default="fixed", choices=["fixed", "dynamic", "diagnostic"], help="fixed 默认不更新 beta；dynamic 才用校准 EMA；diagnostic 只记录 beta_new")
     p.add_argument("--cert_sigma_floor", default=0.01, type=float)
     p.add_argument("--calib_freq", default=5000, type=int)
     p.add_argument("--calib_size", default=512, type=int)
@@ -292,6 +352,8 @@ def make_parser():
 
 def main():
     args = make_parser().parse_args()
+    if args.torch_num_threads > 0:
+        torch.set_num_threads(int(args.torch_num_threads))
     if args.cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
 
@@ -316,6 +378,9 @@ def main():
     env = gym.make(train_env_name)
     train_eval_env = gym.make(train_env_name)
     test_eval_env = gym.make(test_env_name)
+    seed_env(env, args.seed)
+    seed_env(train_eval_env, args.seed + 1000)
+    seed_env(test_eval_env, args.seed + 2000)
     state_dim, goal_dim, action_dim = infer_dims(env)
     print(f"Dims: state_dim={state_dim}, goal_dim={goal_dim}, action_dim={action_dim}")
 
@@ -350,6 +415,8 @@ def main():
         policy_delay=args.policy_delay,
         actor_agg=args.actor_agg,
         action_l2=args.action_l2,
+        deterministic_actor_update=args.deterministic_actor_update,
+        exploration_noise=args.exploration_noise,
         lambda_dir=args.lambda_dir,
         lambda_clo=args.lambda_clo,
         lambda_stitch=args.lambda_stitch,
@@ -363,7 +430,11 @@ def main():
         projection_pool_size=args.projection_pool_size,
         closure_start_updates=args.closure_start_updates,
         closure_margin_z=args.closure_margin_z,
+        closure_loss_target=args.closure_loss_target,
+        td_closure_mode=args.td_closure_mode,
+        td_closure_start_updates=args.td_closure_start_updates,
         beta_init=args.beta_init,
+        beta_mode=args.beta_mode,
         cert_sigma_floor=args.cert_sigma_floor,
         calib_freq=args.calib_freq,
         calib_size=args.calib_size,
@@ -409,7 +480,10 @@ def main():
     last_eval_time = train_start_time
     last_eval_step = 0
     last_episode_distance = float("nan")
+    last_orig_ratio = 0.0
     last_future_ratio = 0.0
+    last_replay_ratio = 0.0
+    last_actor_goal_ratio = 0.0
 
     for t in range(int(args.max_timesteps)):
         episode_timesteps += 1
@@ -438,17 +512,28 @@ def main():
                     replay_buffer,
                     batch_size=args.batch_size,
                     p_orig=args.p_orig,
+                    p_future=args.p_future,
+                    p_replay_goal=args.p_replay_goal,
                     h_relab=args.h_relab,
                     goal_dim=goal_dim,
                     device=device,
                 )
+                last_orig_ratio = float(batch_info.get("orig_goal_ratio", 0.0))
                 last_future_ratio = float(batch_info.get("future_goal_ratio", 0.0))
+                last_replay_ratio = float(batch_info.get("replay_goal_ratio", 0.0))
+                last_actor_goal_ratio = float(batch_info.get("actor_goal_ratio", 0.0))
+                goal_source = np.asarray(batch_info["goal_source_type"]).reshape(-1)
+                # actor 不追 replay/random goal；这些 goal 只通过 TD-Z 给 critic 提供低可达性约束。
+                actor_mask = torch.as_tensor(goal_source != GOAL_TYPE_REPLAY, dtype=torch.bool, device=device)
+                replay_goal_mask = torch.as_tensor(goal_source == GOAL_TYPE_REPLAY, dtype=torch.bool, device=device)
                 metrics = policy.train(
                     state_b,
                     action_b,
                     next_state_b,
                     goal_b,
                     replay_buffer=replay_buffer,
+                    actor_mask=actor_mask,
+                    replay_goal_mask=replay_goal_mask,
                     distance_threshold=args.distance_threshold,
                 )
                 if policy.total_it % args.csv_train_log_freq == 0:
@@ -466,7 +551,10 @@ def main():
                         "seed": args.seed,
                         "replay_size": replay_buffer.num_steps_can_sample(),
                         "train_episode_distance": last_episode_distance,
+                        "train_orig_goal_ratio": last_orig_ratio,
                         "train_future_goal_ratio": last_future_ratio,
+                        "train_replay_goal_ratio": last_replay_ratio,
+                        "train_actor_goal_ratio": last_actor_goal_ratio,
                     }
                     row.update(metrics)
                     csv_logger.write(row)
@@ -518,7 +606,10 @@ def main():
                 "eval_test_success": test_s,
                 "eval_test_distance": test_d,
                 "train_episode_distance": last_episode_distance,
+                "train_orig_goal_ratio": last_orig_ratio,
                 "train_future_goal_ratio": last_future_ratio,
+                "train_replay_goal_ratio": last_replay_ratio,
+                "train_actor_goal_ratio": last_actor_goal_ratio,
                 "calib_beta": policy.beta,
             })
             policy.save(folder)

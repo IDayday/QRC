@@ -205,6 +205,8 @@ class QRCAgent:
         policy_delay: int = 2,
         actor_agg: str = "mean",
         action_l2: float = 1e-4,
+        deterministic_actor_update: bool = True,
+        exploration_noise: float = 0.10,
         lambda_dir: float = 1.0,
         lambda_clo: float = 0.05,
         lambda_stitch: float = 0.0,
@@ -218,7 +220,11 @@ class QRCAgent:
         projection_pool_size: int = 64,
         closure_start_updates: int = 5000,
         closure_margin_z: float = 0.0,
+        closure_loss_target: str = "lcb",
+        td_closure_mode: str = "none",
+        td_closure_start_updates: int = 0,
         beta_init: float = 2.0,
+        beta_mode: str = "fixed",
         cert_sigma_floor: float = 0.01,
         calib_freq: int = 5000,
         calib_size: int = 512,
@@ -235,15 +241,22 @@ class QRCAgent:
         stitch_join_sigma: float = 0.5,
         stitch_join_radius: float = 0.75,
         stitch_min_conf: float = 0.25,
+        actor_log_ema: float = 0.95,
         writer=None,
         logger=None,
     ):
         if closure_source not in ("none", "random", "planner_raw", "planner_projected", "mixed"):
             raise ValueError("closure_source must be none/random/planner_raw/planner_projected/mixed")
+        if beta_mode not in ("fixed", "adaptive", "diagnostic", "dynamic"):
+            raise ValueError("beta_mode must be fixed/dynamic/diagnostic")
         if actor_agg not in ("mean", "min"):
             raise ValueError("actor_agg must be mean or min")
         if distance_mode not in ("xy", "full"):
             raise ValueError("distance_mode must be xy or full")
+        if closure_loss_target not in ("lcb", "raw"):
+            raise ValueError("closure_loss_target must be lcb or raw")
+        if td_closure_mode not in ("none", "recursive_raw", "recursive_lcb"):
+            raise ValueError("td_closure_mode must be none, recursive_raw, or recursive_lcb")
 
         self.state_dim = int(state_dim)
         self.goal_dim = int(goal_dim)
@@ -254,6 +267,10 @@ class QRCAgent:
         self.policy_delay = max(1, int(policy_delay))
         self.actor_agg = actor_agg
         self.action_l2 = float(action_l2)
+        # 中文注释：训练 actor 时默认用确定性 mean action，环境交互时用 mean+Gaussian noise 探索，
+        # 避免无熵正则的随机策略在早期产生过大的方差。
+        self.deterministic_actor_update = bool(deterministic_actor_update)
+        self.exploration_noise = float(exploration_noise)
 
         self.lambda_dir = float(lambda_dir)
         self.lambda_clo = float(lambda_clo)
@@ -268,7 +285,15 @@ class QRCAgent:
         self.projection_pool_size = int(projection_pool_size)
         self.closure_start_updates = int(closure_start_updates)
         self.closure_margin_z = float(closure_margin_z)
+        # 中文注释：safe closure 默认使用 LCB target；raw 只作为“证书是否过保守”的诊断。
+        self.closure_loss_target = str(closure_loss_target)
+        # 中文注释：recursive_* 是不安全 TD backbone 对照，用来判断收益是否依赖递归传播；主方法保持 none。
+        self.td_closure_mode = str(td_closure_mode)
+        self.td_closure_start_updates = int(td_closure_start_updates)
         self.beta = float(beta_init)
+        # 中文注释：上一轮实验中动态校准 beta 触顶后把 closure certificate 压得过保守。
+        # fixed: 使用 beta_init，不更新；diagnostic: 只记录 beta_new，不写回；adaptive: EMA 更新。
+        self.beta_mode = str(beta_mode)
         self.cert_sigma_floor = float(cert_sigma_floor)
         self.calib_freq = int(calib_freq)
         self.calib_size = int(calib_size)
@@ -288,6 +313,14 @@ class QRCAgent:
         self.writer = writer
         self.logger = logger
         self.total_it = 0
+        # 中文注释：记录最近一次 actor update，避免 policy_delay 与 csv_train_log_freq 发生采样别名。
+        self.last_actor_loss = 0.0
+        self.last_actor_z_action_mean = 0.0
+        self.actor_loss_ema = 0.0
+        self.actor_z_action_mean_ema = 0.0
+        self.last_actor_update_it = -1
+        self.actor_update_count = 0
+        self.actor_log_ema = float(actor_log_ema)
 
         hidden = (int(hidden_dim), int(hidden_dim))
         self.actor = SquashedGaussianActor(state_dim, goal_dim, action_dim, hidden).to(device)
@@ -319,7 +352,13 @@ class QRCAgent:
         torch.save(self.critic.state_dict(), os.path.join(folder, "qrc_critic.pth"))
         torch.save(self.critic_target.state_dict(), os.path.join(folder, "qrc_critic_target.pth"))
         torch.save(self.proposal.state_dict(), os.path.join(folder, "qrc_proposal.pth"))
-        torch.save({"total_it": self.total_it, "beta": self.beta}, os.path.join(folder, "qrc_meta.pth"))
+        torch.save({
+            "total_it": self.total_it,
+            "beta": self.beta,
+            "beta_mode": self.beta_mode,
+            "closure_loss_target": self.closure_loss_target,
+            "td_closure_mode": self.td_closure_mode,
+        }, os.path.join(folder, "qrc_meta.pth"))
         if save_optims:
             torch.save(self.actor_opt.state_dict(), os.path.join(folder, "qrc_actor_opt.pth"))
             torch.save(self.critic_opt.state_dict(), os.path.join(folder, "qrc_critic_opt.pth"))
@@ -338,14 +377,21 @@ class QRCAgent:
             meta = torch.load(meta_path, map_location=self.device)
             self.total_it = int(meta.get("total_it", self.total_it))
             self.beta = float(meta.get("beta", self.beta))
+            self.beta_mode = str(meta.get("beta_mode", self.beta_mode))
+            self.closure_loss_target = str(meta.get("closure_loss_target", self.closure_loss_target))
+            self.td_closure_mode = str(meta.get("td_closure_mode", self.td_closure_mode))
 
     @torch.no_grad()
     def select_action(self, state, goal, deterministic: bool = False):
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).view(1, -1)
         goal_t = torch.as_tensor(goal, dtype=torch.float32, device=self.device).view(1, -1)
-        action, _, mean_action = self.actor.sample(state_t, goal_t)
-        out = mean_action if deterministic else action
-        return out.cpu().numpy().reshape(-1)
+        _, _, mean_action = self.actor.sample(state_t, goal_t)
+        action_np = mean_action.cpu().numpy().reshape(-1)
+        if (not deterministic) and self.exploration_noise > 0.0:
+            # 中文注释：QRC actor objective 是确定性最大化 Z；探索噪声只用于采样环境数据。
+            noise = np.random.normal(0.0, self.exploration_noise, size=action_np.shape).astype(np.float32)
+            action_np = np.clip(action_np + noise, -1.0, 1.0)
+        return action_np
 
     # ------------------------------------------------------------------
     # 基础 helper
@@ -445,7 +491,40 @@ class QRCAgent:
             "Evidence/h2": "evidence_h2",
             "Evidence/target_z": "evidence_target_z",
             "Actor/loss": "actor_loss",
+            "Actor/loss_step": "actor_loss_step",
+            "Actor/loss_current": "actor_loss_current",
+            "Actor/loss_ema": "actor_loss_ema",
             "Actor/Z_action_mean": "actor_z_action_mean",
+            "Actor/Z_action_mean_step": "actor_z_action_mean_step",
+            "Actor/Z_action_current": "actor_z_action_current",
+            "Actor/Z_action_mean_ema": "actor_z_action_mean_ema",
+            "Actor/Z_action_ema": "actor_z_action_ema",
+            "Actor/update_flag": "actor_update_flag",
+            "Actor/update_count": "actor_update_count",
+            "Actor/batch_fraction": "actor_batch_fraction",
+            "Z/replay_goal_mean": "z_replay_goal_mean",
+            "Z/actor_goal_mean": "z_actor_goal_mean",
+            "Z/replay_goal_td_target": "z_replay_goal_td_target",
+            "Z/td_target_mean": "z_td_target_mean",
+            "Z/td_hit_rate": "z_td_hit_rate",
+            "QRC_TD/closure_override_rate": "qrc_td_closure_override_rate",
+            "QRC_TD/direct_next_z_mean": "qrc_td_direct_next_z_mean",
+            "QRC_TD/closure_next_z_mean": "qrc_td_closure_next_z_mean",
+            "QRC_TD/closure_gap_mean": "qrc_td_closure_gap_mean",
+            "QRC_TD/best_z_raw": "qrc_td_best_z_raw",
+            "QRC_TD/best_z_lcb": "qrc_td_best_z_lcb",
+            "QRC/closure_uses_raw": "qrc_closure_uses_raw",
+            "Z/direct_gap": "z_direct_gap",
+            "QRC/best_Z_raw": "qrc_best_z_raw",
+            "QRC/best_Z_lcb": "qrc_best_z_lcb",
+            "QRC/pred_Z_mean": "qrc_pred_z_mean",
+            "QRC/closure_gap_raw": "qrc_closure_gap_raw",
+            "QRC/closure_gap_lcb": "qrc_closure_gap_lcb",
+            "QRC/cert_suppression": "qrc_cert_suppression",
+            "QRC/cert_mu_sm": "qrc_cert_mu_sm",
+            "QRC/cert_mu_mg": "qrc_cert_mu_mg",
+            "QRC/cert_sig_sm": "qrc_cert_sig_sm",
+            "QRC/cert_sig_mg": "qrc_cert_sig_mg",
             "Proposal/loss": "proposal_loss",
             "Calib/beta": "calib_beta",
             "Calib/beta_new": "calib_beta_new",
@@ -470,8 +549,9 @@ class QRCAgent:
         probs = np.maximum(lengths, 1).astype(np.float64)
         probs = probs / probs.sum()
         ep = replay_buffer._rng.choice(active, size=batch_size, replace=True, p=probs)
-        chosen_lengths = replay_buffer._episode_lengths[ep].astype(np.int64)
-        step = np.array([replay_buffer._rng.integers(0, max(int(L), 1)) for L in chosen_lengths], dtype=np.int64)
+        chosen_lengths = np.maximum(replay_buffer._episode_lengths[ep].astype(np.int64), 1)
+        # 中文注释：向量化采样 episode 内 step，避免每个 batch 做 Python 循环。
+        step = np.floor(replay_buffer._rng.random(batch_size) * chosen_lengths).astype(np.int64)
         return ep.astype(np.int64), step.astype(np.int64)
 
     def _sample_replay_states_with_indices(self, replay_buffer, batch_size: int):
@@ -489,19 +569,58 @@ class QRCAgent:
         lengths = replay_buffer._episode_lengths[ep].astype(np.int64)
         # future_step=start+h-1，对应 h 步 transition 后的 next_obs。
         max_h = np.minimum(int(horizon), lengths - start)
-        max_h = np.maximum(max_h, 1)
-        h = np.array([replay_buffer._rng.integers(1, int(mh) + 1) for mh in max_h], dtype=np.int64)
+        max_h = np.maximum(max_h, 1).astype(np.int64)
+        # 中文注释：h∈[1,max_h]，future_step=start+h-1，对应 next_obs[future_step]。
+        h = (np.floor(replay_buffer._rng.random(batch_size) * max_h).astype(np.int64) + 1)
         future_step = start + h - 1
         return ep, start, h, future_step
 
     # ------------------------------------------------------------------
     # TD-Z backbone
     # ------------------------------------------------------------------
-    def _td_z_loss(self, state, action, next_state, goal, distance_threshold: float):
+    def _td_z_loss(
+        self,
+        state,
+        action,
+        next_state,
+        goal,
+        distance_threshold: float,
+        replay_goal_mask: Optional[torch.Tensor] = None,
+        actor_mask: Optional[torch.Tensor] = None,
+        replay_buffer=None,
+    ):
         with torch.no_grad():
             hit = self._hit(next_state, goal, distance_threshold)
-            next_z = self._target_z_heads(next_state, goal, deterministic=True).mean(dim=-1, keepdim=True)
-            # 文档公式：Y_TD = gamma * [hit + (1-hit) Z_target(next_state,g)]
+            direct_next_z = self._target_z_heads(next_state, goal, deterministic=True).mean(dim=-1, keepdim=True)
+            next_z = direct_next_z
+
+            # 中文注释：recursive_* 只用于关键安全对照。它把 closure 写进 TD bootstrap，
+            # 正是 QRC 主方法刻意避免的路径；如果它有收益而 safe one-sided 没收益，说明问题在安全注入强度。
+            td_override = torch.zeros_like(direct_next_z)
+            td_closure_z = torch.zeros_like(direct_next_z)
+            td_best_raw = torch.zeros_like(direct_next_z)
+            td_best_lcb = torch.zeros_like(direct_next_z)
+            if (
+                self.td_closure_mode != "none"
+                and replay_buffer is not None
+                and self.total_it >= self.td_closure_start_updates
+                and replay_buffer.num_steps_can_sample() >= max(2, int(next_state.shape[0]))
+            ):
+                cand, _ = self._sample_closure_candidates(next_state, goal, replay_buffer, self.closure_candidates)
+                best_lcb, _, best_non, cert_info = self._closure_certificate(next_state, goal, cand)
+                best_raw = cert_info["best_raw"]
+                td_best_raw = best_raw
+                td_best_lcb = best_lcb
+                if self.td_closure_mode == "recursive_raw":
+                    td_closure_z = best_raw
+                else:
+                    td_closure_z = best_lcb
+                td_closure_z = td_closure_z * (best_non > 0.5).float()
+                td_override = (td_closure_z > direct_next_z).float()
+                next_z = torch.maximum(direct_next_z, td_closure_z).clamp(0.0, 1.0)
+
+            # 文档公式：Y_TD = gamma * [hit + (1-hit) Z_target(next_state,g)]；
+            # 当 td_closure_mode!=none 时这里故意使用 closure-augmented next_z 作为 unsafe diagnostic。
             y = self.gamma * (hit + (1.0 - hit) * next_z)
             y = y.clamp(0.0, 1.0)
         pred_heads = self.critic.forward_z(state, action, goal)
@@ -510,12 +629,41 @@ class QRCAgent:
             d_heads = -torch.log(pred_heads.clamp_min(1e-8))
             metrics = self._float_metrics({
                 "z_td_loss": td_loss,
+                "z_td_target_mean": y.mean(),
+                "z_td_pred_mean": pred_heads.mean(),
+                "z_td_hit_rate": hit.mean(),
                 "z_mean": pred_heads.mean(),
                 "z_min": pred_heads.min(),
                 "z_max": pred_heads.max(),
                 "d_mean": d_heads.mean(),
                 "d_saturation_rate": ((pred_heads < 1e-3) | (pred_heads > 1.0 - 1e-3)).float().mean(),
+                "qrc_td_closure_override_rate": td_override.mean(),
+                "qrc_td_direct_next_z_mean": direct_next_z.mean(),
+                "qrc_td_closure_next_z_mean": td_closure_z.mean(),
+                "qrc_td_closure_gap_mean": (td_closure_z - direct_next_z).mean(),
+                "qrc_td_best_z_raw": td_best_raw.mean(),
+                "qrc_td_best_z_lcb": td_best_lcb.mean(),
             })
+            if replay_goal_mask is not None:
+                rg = replay_goal_mask.detach().view(-1).bool()
+                if rg.any():
+                    metrics.update(self._float_metrics({
+                        "z_replay_goal_mean": pred_heads[rg].mean(),
+                        "z_replay_goal_td_target": y[rg].mean(),
+                    }))
+                else:
+                    metrics.update({"z_replay_goal_mean": 0.0, "z_replay_goal_td_target": 0.0})
+            else:
+                metrics.update({"z_replay_goal_mean": 0.0, "z_replay_goal_td_target": 0.0})
+            if actor_mask is not None:
+                am = actor_mask.detach().view(-1).bool()
+                metrics["actor_batch_fraction"] = float(am.float().mean().cpu())
+                if am.any():
+                    metrics.update(self._float_metrics({"z_actor_goal_mean": pred_heads[am].mean()}))
+                else:
+                    metrics.update({"z_actor_goal_mean": 0.0})
+            else:
+                metrics.update({"actor_batch_fraction": 1.0, "z_actor_goal_mean": float(pred_heads.mean().detach().cpu())})
         return td_loss, metrics
 
     # ------------------------------------------------------------------
@@ -527,6 +675,7 @@ class QRCAgent:
             "z_direct_loss": 0.0,
             "z_direct_pred": 0.0,
             "z_direct_target": 0.0,
+            "z_direct_gap": 0.0,
             "evidence_direct_edge_count": 0.0,
         }
         if replay_buffer is None or replay_buffer.num_steps_can_sample() < 2 or self.lambda_dir <= 0.0:
@@ -556,6 +705,7 @@ class QRCAgent:
             "z_direct_loss": loss,
             "z_direct_pred": pred_heads.mean(),
             "z_direct_target": target_z.mean(),
+            "z_direct_gap": (pred_heads.mean(dim=-1, keepdim=True) - target_z).mean(),
             "evidence_direct_edge_count": float(state.shape[0]),
         })
 
@@ -564,7 +714,8 @@ class QRCAgent:
     # ------------------------------------------------------------------
     def _proposal_loss(self, replay_buffer):
         zero = torch.zeros((), dtype=torch.float32, device=self.device)
-        if (not self.use_proposal) or self.lambda_proposal <= 0.0 or replay_buffer is None or replay_buffer.num_steps_can_sample() < 2:
+        needs_proposal = self.closure_source in ("planner_raw", "planner_projected", "mixed")
+        if (not needs_proposal) or (not self.use_proposal) or self.lambda_proposal <= 0.0 or replay_buffer is None or replay_buffer.num_steps_can_sample() < 2:
             return zero, {"proposal_loss": 0.0}
         sample = self._sample_future_pairs(replay_buffer, min(self.direct_batch_size, 256), self.h_relab)
         if sample is None:
@@ -669,6 +820,8 @@ class QRCAgent:
         mu_mg = z_mg.mean(dim=-1, keepdim=True)
         sig_sm = z_sm.std(dim=-1, keepdim=True, unbiased=False) if z_sm.shape[-1] > 1 else torch.zeros_like(mu_sm)
         sig_mg = z_mg.std(dim=-1, keepdim=True, unbiased=False) if z_mg.shape[-1] > 1 else torch.zeros_like(mu_mg)
+        # raw mean-product 只用于诊断；LCB-product 才用于训练。
+        z_raw = (mu_sm * mu_mg).view(B, M, 1).clamp(0.0, 1.0)
         lcb_sm = (mu_sm - self.beta * (sig_sm + self.cert_sigma_floor)).clamp(0.0, 1.0)
         lcb_mg = (mu_mg - self.beta * (sig_mg + self.cert_sigma_floor)).clamp(0.0, 1.0)
         z_cert = (lcb_sm * lcb_mg).view(B, M, 1).clamp(0.0, 1.0)
@@ -676,17 +829,31 @@ class QRCAgent:
         d_sm = self._dist_state_state(state[:, None, :].expand(-1, M, -1), cand)
         d_mg = self._dist_state_goal(cand.reshape(B * M, D), g_flat).view(B, M, 1)
         nondeg = ((d_sm >= self.anti_degenerate_min_dist) & (d_mg >= self.anti_degenerate_min_dist)).float()
+        z_raw = z_raw * nondeg
         z_cert = z_cert * nondeg
 
         best_idx = z_cert.squeeze(-1).argmax(dim=1)
         row = torch.arange(B, device=self.device)
         best_z = z_cert[row, best_idx]
+        best_raw_at_lcb = z_raw[row, best_idx]
+        best_raw_idx = z_raw.squeeze(-1).argmax(dim=1)
+        best_raw = z_raw[row, best_raw_idx]
         best_m = cand[row, best_idx]
         best_non = nondeg[row, best_idx]
+        mu_sm_v = mu_sm.view(B, M, 1)[row, best_idx]
+        mu_mg_v = mu_mg.view(B, M, 1)[row, best_idx]
+        sig_sm_v = sig_sm.view(B, M, 1)[row, best_idx]
+        sig_mg_v = sig_mg.view(B, M, 1)[row, best_idx]
         return best_z, best_m, best_non, {
+            "best_raw": best_raw,
+            "best_raw_at_lcb": best_raw_at_lcb,
             "nondeg_all": nondeg,
             "d_sm": d_sm[row, best_idx],
             "d_mg": d_mg[row, best_idx],
+            "mu_sm": mu_sm_v,
+            "mu_mg": mu_mg_v,
+            "sig_sm": sig_sm_v,
+            "sig_mg": sig_mg_v,
         }
 
     def _closure_loss(self, replay_buffer):
@@ -695,6 +862,9 @@ class QRCAgent:
             "qrc_closure_loss": 0.0,
             "qrc_closure_uplift": 0.0,
             "qrc_best_z_cert": 0.0,
+            "qrc_best_z_lcb": 0.0,
+            "qrc_best_z_raw": 0.0,
+            "qrc_best_z_raw_at_lcb": 0.0,
             "qrc_best_d_cert": 0.0,
             "qrc_witness_hit_rate": 0.0,
             "qrc_candidate_m": float(self.closure_candidates),
@@ -702,10 +872,19 @@ class QRCAgent:
             "qrc_random_vs_projected_ratio": 0.0,
             "qrc_closure_accept_rate": 0.0,
             "qrc_closure_gap": 0.0,
+            "qrc_closure_gap_lcb": 0.0,
+            "qrc_closure_gap_raw": 0.0,
+            "qrc_pred_z_mean": 0.0,
+            "qrc_cert_suppression": 0.0,
+            "qrc_cert_mu_sm": 0.0,
+            "qrc_cert_mu_mg": 0.0,
+            "qrc_cert_sig_sm": 0.0,
+            "qrc_cert_sig_mg": 0.0,
             "qrc_raw_planner_failure_rate": 0.0,
             "qrc_projected_distance": 0.0,
             "qrc_triangle_violation_rate": 0.0,
             "qrc_closure_target_outlier_rate": 0.0,
+            "qrc_closure_uses_raw": 1.0 if self.closure_loss_target == "raw" else 0.0,
         }
         if (
             self.lambda_clo <= 0.0
@@ -718,31 +897,59 @@ class QRCAgent:
 
         state, goal = self._sample_bridge_anchors(replay_buffer, self.closure_batch_size)
         cand, cand_info = self._sample_closure_candidates(state, goal, replay_buffer, self.closure_candidates)
-        best_z, _, best_non, cert_info = self._closure_certificate(state, goal, cand)
+        best_z_lcb, _, best_non, cert_info = self._closure_certificate(state, goal, cand)
 
         # 中文注释：closure loss 只更新 critic。actor action stop-gradient，避免 closure 直接牵动 actor。
         with torch.no_grad():
             a_bar = self._actor_action(self.actor, state, goal, deterministic=True)
         pred_heads = self.critic.forward_z(state, a_bar, goal)
         pred_mean = pred_heads.mean(dim=-1, keepdim=True)
-        uplift = F.relu(best_z.detach() - pred_heads - self.closure_margin_z)
+        lcb_gap = best_z_lcb.detach() - pred_mean.detach()
+        raw_gap = cert_info["best_raw"].detach() - pred_mean.detach()
+
+        if self.closure_loss_target == "raw":
+            # 中文注释：one-sided raw 是安全性诊断：仍然非递归，但不用 LCB 扣减，判断 LCB 是否过保守。
+            target_z = cert_info["best_raw"].detach()
+            gap = raw_gap
+            accept = ((gap > self.closure_margin_z) & (target_z > 0.0)).float()
+        else:
+            target_z = best_z_lcb.detach()
+            gap = lcb_gap
+            accept = ((gap > self.closure_margin_z) & (best_non > 0.5)).float()
+        raw_accept = ((raw_gap > self.closure_margin_z) & (cert_info["best_raw"] > 0.0)).float()
+        # 中文注释：只有 target 明确高于当前估计的样本才产生 tightening。
+        uplift = accept.detach() * F.relu(target_z - pred_heads - self.closure_margin_z)
         loss = F.smooth_l1_loss(uplift, torch.zeros_like(uplift), reduction="mean")
-        gap = best_z.detach() - pred_mean.detach()
-        accept = ((gap > self.closure_margin_z) & (best_non > 0.5)).float()
-        best_d = -torch.log(best_z.clamp_min(1e-8))
+        best_d = -torch.log(target_z.clamp_min(1e-8))
+        raw_fail = (1.0 - best_non.mean()) if self.closure_source == "planner_raw" else torch.zeros_like(best_non.mean())
         metrics = self._float_metrics({
             "qrc_closure_loss": loss,
             "qrc_closure_uplift": uplift.mean(),
-            "qrc_best_z_cert": best_z.mean(),
+            "qrc_best_z_cert": target_z.mean(),
+            "qrc_best_z_lcb": best_z_lcb.mean(),
+            "qrc_best_z_raw": cert_info["best_raw"].mean(),
+            "qrc_best_z_raw_at_lcb": cert_info["best_raw_at_lcb"].mean(),
             "qrc_best_d_cert": best_d.mean(),
+            "qrc_pred_z_mean": pred_mean.mean(),
+            "qrc_closure_gap_lcb": lcb_gap.mean(),
+            "qrc_lcb_gap": lcb_gap.mean(),
+            "qrc_closure_gap_raw": raw_gap.mean(),
+            "qrc_raw_gap": raw_gap.mean(),
+            "qrc_closure_uses_raw": 1.0 if self.closure_loss_target == "raw" else 0.0,
+            "qrc_cert_suppression": (cert_info["best_raw_at_lcb"] - best_z_lcb).mean(),
+            "qrc_cert_mu_sm": cert_info["mu_sm"].mean(),
+            "qrc_cert_mu_mg": cert_info["mu_mg"].mean(),
+            "qrc_cert_sig_sm": cert_info["sig_sm"].mean(),
+            "qrc_cert_sig_mg": cert_info["sig_mg"].mean(),
             "qrc_witness_hit_rate": accept.mean(),
             "qrc_candidate_m": float(self.closure_candidates),
             "qrc_nondegenerate_rate": cert_info["nondeg_all"].mean(),
             "qrc_closure_accept_rate": accept.mean(),
+            "qrc_raw_accept_rate": raw_accept.mean(),
             "qrc_closure_gap": gap.mean(),
-            "qrc_raw_planner_failure_rate": 1.0 - best_non.mean(),
+            "qrc_raw_planner_failure_rate": raw_fail,
             "qrc_triangle_violation_rate": accept.mean(),
-            "qrc_closure_target_outlier_rate": (best_z > 0.98).float().mean(),
+            "qrc_closure_target_outlier_rate": (target_z > 0.98).float().mean(),
         })
         metrics.update({k: float(v) for k, v in cand_info.items()})
         return loss, metrics
@@ -796,8 +1003,8 @@ class QRCAgent:
 
         lengths2 = replay_buffer._episode_lengths[best_ep2].astype(np.int64)
         max_h2 = np.minimum(self.stitch_h2_max, lengths2 - best_start2)
-        max_h2 = np.maximum(max_h2, 1)
-        h2 = np.array([replay_buffer._rng.integers(1, int(mh) + 1) for mh in max_h2], dtype=np.int64)
+        max_h2 = np.maximum(max_h2, 1).astype(np.int64)
+        h2 = (np.floor(replay_buffer._rng.random(B) * max_h2).astype(np.int64) + 1)
         g_step2 = best_start2 + h2 - 1
         if ag_key in replay_buffer._next_obs:
             g_np = replay_buffer._next_obs[ag_key][best_ep2, g_step2]
@@ -829,7 +1036,9 @@ class QRCAgent:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def update_beta(self, replay_buffer):
-        if self.calib_freq <= 0 or replay_buffer is None or self.total_it % self.calib_freq != 0 or replay_buffer.num_steps_can_sample() < 2:
+        if self.beta_mode == "fixed":
+            return {"calib_beta": self.beta, "calib_beta_new": self.beta}
+        if self.calib_freq <= 0 or replay_buffer is None or self.total_it <= 0 or self.total_it % self.calib_freq != 0 or replay_buffer.num_steps_can_sample() < 2:
             return {"calib_beta": self.beta, "calib_beta_new": self.beta}
         sample = self._sample_future_pairs(replay_buffer, self.calib_size, self.h_relab)
         if sample is None:
@@ -859,8 +1068,10 @@ class QRCAgent:
         if finite.any():
             beta_new = float(torch.quantile(z_score.reshape(-1)[finite].clamp(0.0, 20.0), self.calib_quantile).cpu())
             beta_new = float(np.clip(beta_new, 0.5, 10.0))
-            self.beta = (1.0 - self.calib_ema) * self.beta + self.calib_ema * beta_new
-            self.beta = float(np.clip(self.beta, 0.5, 10.0))
+            if self.beta_mode in ("adaptive", "dynamic"):
+                self.beta = (1.0 - self.calib_ema) * self.beta + self.calib_ema * beta_new
+                self.beta = float(np.clip(self.beta, 0.5, 10.0))
+            # diagnostic 模式只记录 beta_new，不更新 self.beta。
         return {"calib_beta": self.beta, "calib_beta_new": beta_new}
 
     # ------------------------------------------------------------------
@@ -873,9 +1084,14 @@ class QRCAgent:
         next_state: torch.Tensor,
         goal: torch.Tensor,
         replay_buffer=None,
+        actor_mask: Optional[torch.Tensor] = None,
+        replay_goal_mask: Optional[torch.Tensor] = None,
         distance_threshold: float = 0.5,
     ) -> Dict[str, float]:
-        td_loss, td_metrics = self._td_z_loss(state, action, next_state, goal, distance_threshold)
+        td_loss, td_metrics = self._td_z_loss(
+            state, action, next_state, goal, distance_threshold,
+            replay_goal_mask=replay_goal_mask, actor_mask=actor_mask, replay_buffer=replay_buffer,
+        )
         direct_loss, direct_metrics = self._direct_evidence_loss(replay_buffer)
         closure_loss, closure_metrics = self._closure_loss(replay_buffer)
         stitch_loss, stitch_metrics = self._stitch_loss(replay_buffer)
@@ -899,18 +1115,52 @@ class QRCAgent:
             torch.nn.utils.clip_grad_norm_(self.proposal.parameters(), max_norm=10.0)
             self.proposal_opt.step()
 
-        actor_loss = torch.zeros((), dtype=torch.float32, device=self.device)
-        actor_z = torch.zeros((), dtype=torch.float32, device=self.device)
+        actor_loss_step = torch.zeros((), dtype=torch.float32, device=self.device)
+        actor_z_step = torch.zeros((), dtype=torch.float32, device=self.device)
+        actor_update_flag = 0.0
         if self.total_it % self.policy_delay == 0:
-            a_pi, _, _ = self.actor.sample(state, goal)
-            z_heads = self.critic.forward_z(state, a_pi, goal)
+            # 中文注释：actor 只在原始目标 + same-episode future goals 上更新；replay/random goal 只约束 critic TD。
+            if actor_mask is not None:
+                mask = actor_mask.view(-1).bool()
+                if mask.any():
+                    actor_state = state[mask]
+                    actor_goal = goal[mask]
+                else:
+                    actor_state = state
+                    actor_goal = goal
+            else:
+                actor_state = state
+                actor_goal = goal
+            # 中文注释：actor 更新只需要 critic 对 action 的梯度，不需要累计 critic 参数梯度；
+            # 暂时冻结 critic 参数可减少显存和无用梯度写入。
+            for p in self.critic.parameters():
+                p.requires_grad_(False)
+            if self.deterministic_actor_update:
+                _, _, a_pi = self.actor.sample(actor_state, actor_goal)
+            else:
+                a_pi, _, _ = self.actor.sample(actor_state, actor_goal)
+            z_heads = self.critic.forward_z(actor_state, a_pi, actor_goal)
             z_for_actor = z_heads.mean(dim=-1, keepdim=True) if self.actor_agg == "mean" else z_heads.min(dim=-1, keepdim=True)[0]
-            actor_z = z_for_actor.mean()
-            actor_loss = -actor_z + self.action_l2 * a_pi.pow(2).mean()
+            actor_z_step = z_for_actor.mean()
+            actor_loss_step = -actor_z_step + self.action_l2 * a_pi.pow(2).mean()
             self.actor_opt.zero_grad(set_to_none=True)
-            actor_loss.backward()
+            actor_loss_step.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=10.0)
             self.actor_opt.step()
+            for p in self.critic.parameters():
+                p.requires_grad_(True)
+            actor_update_flag = 1.0
+            self.actor_update_count += 1
+            self.last_actor_loss = float(actor_loss_step.detach().cpu())
+            self.last_actor_z_action_mean = float(actor_z_step.detach().cpu())
+            self.last_actor_update_it = int(self.total_it)
+            if self.actor_update_count == 1:
+                self.actor_loss_ema = self.last_actor_loss
+                self.actor_z_action_mean_ema = self.last_actor_z_action_mean
+            else:
+                decay = min(max(self.actor_log_ema, 0.0), 0.999)
+                self.actor_loss_ema = decay * self.actor_loss_ema + (1.0 - decay) * self.last_actor_loss
+                self.actor_z_action_mean_ema = decay * self.actor_z_action_mean_ema + (1.0 - decay) * self.last_actor_z_action_mean
 
         beta_metrics = self.update_beta(replay_buffer)
         self.total_it += 1
@@ -918,8 +1168,20 @@ class QRCAgent:
 
         metrics = self._float_metrics({
             "critic_loss": critic_loss,
-            "actor_loss": actor_loss,
-            "actor_z_action_mean": actor_z,
+            # actor_loss / actor_z_action_mean 记录最近一次 actor update，防止日志采样别名；
+            # *_step 只表示当前 train step 是否实际发生 actor update。
+            "actor_loss": self.last_actor_loss,
+            "actor_z_action_mean": self.last_actor_z_action_mean,
+            "actor_loss_step": actor_loss_step,
+            "actor_loss_current": actor_loss_step,
+            "actor_z_action_mean_step": actor_z_step,
+            "actor_z_action_current": actor_z_step,
+            "actor_loss_ema": self.actor_loss_ema,
+            "actor_z_action_mean_ema": self.actor_z_action_mean_ema,
+            "actor_z_action_ema": self.actor_z_action_mean_ema,
+            "actor_update_flag": actor_update_flag,
+            "actor_update_count": float(self.actor_update_count),
+            "actor_last_update_age": float(self.total_it - self.last_actor_update_it) if self.last_actor_update_it >= 0 else -1.0,
         })
         metrics.update(td_metrics)
         metrics.update(direct_metrics)
